@@ -1,6 +1,6 @@
 [submodule "Hog"]
 	path = Hog
-	url = ../../gitlab.com/hog-cern/Hog.git
+	url = https://gitlab.com/hog-cern/Hog.git
 [submodule "submodules/core-comblock"]
 	path = submodules/core-comblock
 	url = https://gitlab.com/ictp-mlab/core-comblock.git
