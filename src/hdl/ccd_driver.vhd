@@ -1,174 +1,221 @@
 ----------------------------------------------------------------------------------
--- Company: 
--- Engineer: 
--- 
--- Create Date: 01/21/2026 06:39:38 AM
--- Design Name: 
 -- Module Name: ccd_clock - Behavioral
--- Project Name: 
--- Target Devices: 
--- Tool Versions: 
--- Description: 
--- 
--- Dependencies: 
--- 
--- Revision:
--- Revision 0.01 - File Created
--- Additional Comments:
--- 
+-- Description: Controlador de sincronización para CCD Lineal TCD1304
+--              con tiempo de integración parametrizable y señales de sincronía
 ----------------------------------------------------------------------------------
-
 
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
-
--- Uncomment the following library declaration if using
--- arithmetic functions with Signed or Unsigned values
---use IEEE.NUMERIC_STD.ALL;
-
--- Uncomment the following library declaration if instantiating
--- any Xilinx leaf cells in this code.
---library UNISIM;
---use UNISIM.VComponents.all;
+use IEEE.NUMERIC_STD.ALL;
 
 entity ccd_clock is
-    Port ( clk : in STD_LOGIC;
-           RST : in STD_LOGIC;
-           fim : out STD_LOGIC;
-           sh : out STD_LOGIC;
-           icg : out STD_LOGIC;
-           clk_o : out std_logic
-           );
+    Generic (
+        CLK_FREQ_HZ     : integer := 100_000_000; -- Frecuencia reloj principal (ej. 100 MHz)
+        PHIM_FREQ_HZ    : integer := 2_000_000;   -- Frecuencia phiM para el CCD (2 MHz)
+        DEFAULT_T_INT   : integer := 20_000       -- Tiempo de integración por defecto (en ciclos phiM)
+    );
+    Port (
+        clk             : in  STD_LOGIC;
+        rst_n             : in  STD_LOGIC;
+        
+        -- Variable única de control de tiempo de integración / exposición (en ciclos de phiM)
+        i_t_int_cycles  : in  STD_LOGIC_VECTOR(31 downto 0);
+        
+        -- Salidas físicas hacia el CCD TCD1304
+        fim             : out STD_LOGIC; -- Master Clock (phiM)
+        clk_o           : out STD_LOGIC; -- Réplica de phiM
+        sh              : out STD_LOGIC; -- Shift Pulse
+        icg             : out STD_LOGIC; -- Integration Clear Gate
+        
+        -- Señales de sincronización para adquisición (listas para acoplar al XADC)
+        frame_start     : out STD_LOGIC; -- Pulso de inicio de trama
+        pixel_valid     : out STD_LOGIC; -- Píxel válido para muestreo
+        pixel_count     : out STD_LOGIC_VECTOR(11 downto 0) -- Índice del píxel actual (0 a 3693)
+    );
 end ccd_clock;
 
 architecture Behavioral of ccd_clock is
 
-signal fim_int  : std_logic := '0';
-signal sh_int  : std_logic := '0';
-signal icg_int  : std_logic := '0';
-signal offset_flag  : std_logic := '1';
-signal offset_flag_sh  : std_logic := '1';
-signal t1_flag_sh  : std_logic := '0';
-signal t2_flag_sh  : std_logic := '0';
-signal t3_flag_sh  : std_logic := '0';
-signal t4_flag_sh  : std_logic := '0';
+    -- Divisor de reloj para phiM
+    constant CLK_DIV_COUNT  : integer := CLK_FREQ_HZ / (2 * PHIM_FREQ_HZ);
+    
+    -- Lectura mínima requerida por datasheet: 3694 píxeles * 4 ciclos phiM/píxel = 14776 ciclos
+    constant MIN_READOUT_CYCLES : unsigned(31 downto 0) := to_unsigned(14776, 32);
 
-signal t1_flag_icg  : std_logic := '0';
+    -- Señales de reloj
+    signal clk_div_cnt  : integer range 0 to CLK_DIV_COUNT - 1 := 0;
+    signal phiM_reg     : std_logic := '0';
+    signal phiM_tick    : std_logic := '0';
 
+    -- Estados de la máquina FSM
+    type state_type is (ST_RESET, ST_ICG_LOW, ST_SH_HIGH, ST_SH_LOW, ST_READOUT, ST_WAIT_INTEGRATION);
+    signal state : state_type := ST_RESET;
 
+    -- Contadores
+    signal phim_cycle_cnt : unsigned(31 downto 0) := (others => '0');
+    signal frame_cnt      : unsigned(31 downto 0) := (others => '0');
+    signal pixel_cnt      : unsigned(11 downto 0) := (others => '0');
+    signal phiM_per_pixel : unsigned(1 downto 0)  := (others => '0');
+    
+    -- Duración de pulsos en ciclos de phiM (a 2 MHz, 1 ciclo = 500 ns)
+    -- t2 (ICG low a SH high) = 1 ciclo (500 ns)  [Req: 100ns a 1000ns]
+    -- t3 (Ancho de pulso SH)  = 3 ciclos (1.5 us) [Req: > 1000ns]
+    -- t1 (ICG low tras SH)   = 3 ciclos (1.5 us) [Req: 1000ns a 5000ns]
+    constant T2_CYCLES : unsigned(31 downto 0) := to_unsigned(1, 32);
+    constant T3_CYCLES : unsigned(31 downto 0) := to_unsigned(3, 32);
+    constant T1_CYCLES : unsigned(31 downto 0) := to_unsigned(3, 32);
 
-signal contador_fim : integer range 0 to 64 := 0;
-signal contador_sh : integer range 0 to 5000000 := 0;
-signal contador_icg : integer range 0 to 5000000 := 0;
+    -- Registros internos
+    signal sh_reg          : std_logic := '0';
+    signal icg_reg         : std_logic := '1';
+    signal frame_start_reg : std_logic := '0';
+    signal pixel_valid_reg : std_logic := '0';
 
---constants for counts of timers
-constant half_cycle_count_fim : integer := 30;
-constant t1_num_cycles : integer := 2;  -- usage: (t1_num_cycles * half_cycle_count_fim) - 1 is the limit for this time period, counter starts at 0
-constant t2_num_cycles : integer := 25;
-constant t3_num_cycles : integer := 25;
-constant t4_num_cycles : integer := 8;
-constant sum_t : integer := t1_num_cycles + t2_num_cycles + t3_num_cycles + t4_num_cycles;
-constant readout_time_cycles : integer := (half_cycle_count_fim * 4 * 2 * 3694) + 28 * half_cycle_count_fim;
+    signal target_t_int    : unsigned(31 downto 0);
 
 begin
---fim module main clock output
-process (clk)
-begin
-   if rising_edge(clk) then
-      if contador_fim >= half_cycle_count_fim - 1 then --29 for 2 MHz
-         fim_int <=  not fim_int;  
-         contador_fim <= 0;
-      else
-         contador_fim <= contador_fim + 1;
-      end if;
-   end if;
-end process;    
 
-process (clk)
-begin
-    if rising_edge(clk) then
-        if offset_flag_sh = '0' then
-            if t1_flag_sh = '0' then  --Flag t1
-                if contador_sh >= (half_cycle_count_fim * t1_num_cycles) - 1 then   
-                    contador_sh <= 0;
-                    sh_int <= not sh_int; --change value for output of sh
-                    t1_flag_sh <= '1'; --exit t1
-                else
-                    contador_sh <= contador_sh + 1;
-                end if;
-            elsif t1_flag_sh = '1' and t2_flag_sh = '0' then --Flag t2
-                if contador_sh >= (half_cycle_count_fim * t2_num_cycles) - 1 then   
-                    contador_sh <= 0;
-                    sh_int <= not sh_int; --change value for output of sh
-                    t2_flag_sh <= '1';
-                else
-                    contador_sh <= contador_sh + 1;
-                end if;
-            elsif t2_flag_sh = '1' and t3_flag_sh = '0' then --Flag t3
-                if contador_sh >= (half_cycle_count_fim * t3_num_cycles) -1 then   
-                    contador_sh <= 0;                    
-                    t3_flag_sh <= '1';
-                else
-                    contador_sh <= contador_sh + 1;
-                end if;
-            elsif t3_flag_sh = '1' then --Flag t4
-                if contador_sh >= (half_cycle_count_fim * t4_num_cycles) - 1 then   
-                    contador_sh <= 0;
-                    t1_flag_sh <= '0'; --Reset all Flags
-                    t2_flag_sh <= '0';
-                    t3_flag_sh <= '0';
-                else
-                    contador_sh <= contador_sh + 1;
-                end if;
-            end if;    
-        else 
-            if contador_sh >= half_cycle_count_fim - 1 then
-                contador_sh <= 0;
-                offset_flag_sh <= '0';
-            else 
-               contador_sh <= contador_sh + 1;
-            end if;    
+    -- Selección del tiempo de integración (protege contra valores menores al límite físico del CCD)
+    process(i_t_int_cycles)
+        variable user_t_int : unsigned(31 downto 0);
+    begin
+        user_t_int := unsigned(i_t_int_cycles);
+        if user_t_int < MIN_READOUT_CYCLES then
+            if user_t_int = 0 then
+                target_t_int <= to_unsigned(DEFAULT_T_INT, 32);
+            else
+                target_t_int <= MIN_READOUT_CYCLES;
+            end if;
+        else
+            target_t_int <= user_t_int;
         end if;
-    end if;
-end process;    
+    end process;
 
-process (clk)    
-begin
-   if rising_edge(clk) then
-       if offset_flag = '0' then
-           if t1_flag_icg = '0' then
-                if contador_icg >= (half_cycle_count_fim * sum_t) - 1 then --62 for 2 MHz
-                    icg_int <=  not icg_int;  
-                    contador_icg <= 0;
-                    t1_flag_icg <= '1';
-                else
-                    contador_icg <= contador_icg + 1;
+    -- 1. Generador de reloj phiM y pulso tick de sincronización
+    process(clk, rst_n)
+    begin
+        if rst_n = '0' then
+            clk_div_cnt <= 0;
+            phiM_reg    <= '0';
+            phiM_tick   <= '0';
+        elsif rising_edge(clk) then
+            phiM_tick <= '0';
+            if clk_div_cnt = CLK_DIV_COUNT - 1 then
+                clk_div_cnt <= 0;
+                phiM_reg    <= not phiM_reg;
+                if phiM_reg = '0' then
+                    phiM_tick <= '1'; -- Pulso de un ciclo de 'clk' en el flanco de subida de phiM
                 end if;
-           else          
-               if contador_icg >= readout_time_cycles - 1 then --readout time out for icg
-                   icg_int <=  not icg_int;
-                   contador_icg <= 0;
-                   t1_flag_icg <= '0';
-               else 
-                   contador_icg <= contador_icg + 1;
-               end if;               
-           end if;
-       else
-           if contador_icg >= (half_cycle_count_fim * (sum_t + 1)) - 1 then --to offset signal
-               contador_icg <= 0;
-               offset_flag <= '0';
-           else 
-               contador_icg <= contador_icg + 1;
-           end if;           
-       end if;         
-   end if;
-end process;  
+            else
+                clk_div_cnt <= clk_div_cnt + 1;
+            end if;
+        end if;
+    end process;
 
---conexiones para actualizar outputs cuando se actualizan los valores en los procesos
-fim <= fim_int;
-clk_o <= fim_int;
-sh <= sh_int;
-icg <= icg_int;
+    -- 2. Máquina de estados principal del TCD1304
+    process(clk, rst_n)
+    begin
+        if rst_n = '0' then
+            state           <= ST_RESET;
+            sh_reg          <= '0';
+            icg_reg         <= '1';
+            phim_cycle_cnt  <= (others => '0');
+            frame_cnt       <= (others => '0');
+            pixel_cnt       <= (others => '0');
+            phiM_per_pixel  <= (others => '0');
+            frame_start_reg <= '0';
+            pixel_valid_reg <= '0';
+        elsif rising_edge(clk) then
+            frame_start_reg <= '0';
 
+            if phiM_tick = '1' then
+                phim_cycle_cnt <= phim_cycle_cnt + 1;
+                frame_cnt      <= frame_cnt + 1;
+
+                case state is
+
+                    when ST_RESET =>
+                        sh_reg          <= '0';
+                        icg_reg         <= '1';
+                        phim_cycle_cnt  <= (others => '0');
+                        frame_cnt       <= (others => '0');
+                        pixel_cnt       <= (others => '0');
+                        state           <= ST_ICG_LOW;
+
+                    -- Flanco descendente de ICG (Inicio de ciclo de obturador)
+                    when ST_ICG_LOW =>
+                        icg_reg         <= '0';
+                        sh_reg          <= '0';
+                        frame_start_reg <= '1';
+                        if phim_cycle_cnt >= T2_CYCLES - 1 then
+                            phim_cycle_cnt <= (others => '0');
+                            state          <= ST_SH_HIGH;
+                        end if;
+
+                    -- Pulso SH en ALTO
+                    when ST_SH_HIGH =>
+                        sh_reg <= '1';
+                        if phim_cycle_cnt >= T3_CYCLES - 1 then
+                            phim_cycle_cnt <= (others => '0');
+                            state          <= ST_SH_LOW;
+                        end if;
+
+                    -- SH vuelve a BAJO y mantiene ICG en BAJO por el tiempo t1
+                    when ST_SH_LOW =>
+                        sh_reg <= '0';
+                        if phim_cycle_cnt >= T1_CYCLES - 1 then
+                            phim_cycle_cnt <= (others => '0');
+                            icg_reg        <= '1'; -- Sube ICG: Inicia lectura de píxeles en OS
+                            pixel_cnt      <= (others => '0');
+                            phiM_per_pixel <= (others => '0');
+                            state          <= ST_READOUT;
+                        end if;
+
+                    -- Lectura de los 3694 píxeles (4 ciclos de phiM por píxel)
+                    when ST_READOUT =>
+                        phiM_per_pixel <= phiM_per_pixel + 1;
+
+                        -- Activa la señal de píxel válido en el momento óptimo del periodo
+                        if phiM_per_pixel = "01" then
+                            pixel_valid_reg <= '1';
+                        else
+                            pixel_valid_reg <= '0';
+                        end if;
+
+                        if phiM_per_pixel = "11" then
+                            if pixel_cnt = 3693 then
+                                pixel_valid_reg <= '0';
+                                state           <= ST_WAIT_INTEGRATION;
+                            else
+                                pixel_cnt <= pixel_cnt + 1;
+                            end if;
+                        end if;
+
+                    -- Estado de integración: Espera hasta completar el tiempo t_INT configurado
+                    when ST_WAIT_INTEGRATION =>
+                        pixel_valid_reg <= '0';
+                        if frame_cnt >= target_t_int then
+                            phim_cycle_cnt <= (others => '0');
+                            frame_cnt      <= (others => '0');
+                            state          <= ST_ICG_LOW; -- Inicia la siguiente trama
+                        end if;
+
+                    when others =>
+                        state <= ST_RESET;
+
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- Asignación de salidas
+    fim         <= phiM_reg;
+    clk_o       <= phiM_reg;
+    sh          <= sh_reg;
+    icg         <= icg_reg;
+    
+    frame_start <= frame_start_reg;
+    pixel_valid <= pixel_valid_reg;
+    pixel_count <= std_logic_vector(pixel_cnt);
 
 end Behavioral;
