@@ -29,6 +29,7 @@ entity ccd_clock is
         
         -- Señales de sincronización para adquisición (listas para acoplar al XADC)
         frame_start     : out STD_LOGIC; -- Pulso de inicio de trama
+        frame_counter_out : out STD_LOGIC_VECTOR(31 downto 0);
         pixel_valid     : out STD_LOGIC; -- Píxel válido para muestreo
         pixel_count     : out STD_LOGIC_VECTOR(11 downto 0) -- Índice del píxel actual (0 a 3693)
     );
@@ -54,6 +55,7 @@ architecture Behavioral of ccd_clock is
     -- Contadores
     signal phim_cycle_cnt : unsigned(31 downto 0) := (others => '0');
     signal frame_cnt      : unsigned(31 downto 0) := (others => '0');
+    signal total_frames : unsigned(31 downto 0) := (others => '0');
     signal pixel_cnt      : unsigned(11 downto 0) := (others => '0');
     signal phiM_per_pixel : unsigned(1 downto 0)  := (others => '0');
     
@@ -151,6 +153,9 @@ begin
                             phim_cycle_cnt <= (others => '0');
                             state          <= ST_SH_HIGH;
                         end if;
+                        if phim_cycle_cnt = 0 then
+                            total_frames <= total_frames + 1;
+                        end if;
 
                     -- Pulso SH en ALTO
                     when ST_SH_HIGH =>
@@ -216,6 +221,7 @@ begin
     
     frame_start <= frame_start_reg;
     pixel_valid <= pixel_valid_reg;
+    frame_counter_out <= std_logic_vector(total_frames);
     pixel_count <= std_logic_vector(pixel_cnt);
 
 end Behavioral;

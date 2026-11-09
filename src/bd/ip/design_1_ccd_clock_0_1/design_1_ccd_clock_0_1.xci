@@ -52,6 +52,7 @@
         "sh": [ { "direction": "out" } ],
         "icg": [ { "direction": "out" } ],
         "frame_start": [ { "direction": "out" } ],
+        "frame_counter_out": [ { "direction": "out", "size_left": "31", "size_right": "0" } ],
         "pixel_valid": [ { "direction": "out" } ],
         "pixel_count": [ { "direction": "out", "size_left": "11", "size_right": "0" } ]
       },

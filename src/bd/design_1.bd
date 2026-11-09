@@ -2102,6 +2102,11 @@
           "frame_start": {
             "direction": "O"
           },
+          "frame_counter_out": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
           "pixel_valid": {
             "direction": "O"
           },
@@ -2301,6 +2306,12 @@
           "fim_0"
         ]
       },
+      "ccd_clock_0_frame_counter_out": {
+        "ports": [
+          "ccd_clock_0/frame_counter_out",
+          "comblock_0/reg0_i"
+        ]
+      },
       "ccd_clock_0_icg": {
         "ports": [
           "ccd_clock_0/icg",
@@ -2339,9 +2350,9 @@
           "comblock_0/axif_aclk",
           "rst_ps7_0_100M/slowest_sync_clk",
           "comblock_0/axil_aclk",
-          "ccd_clock_0/clk",
           "xadc_wiz_0/dclk_in",
-          "xadc_sampler_to_RAM_0/clk"
+          "xadc_sampler_to_RAM_0/clk",
+          "ccd_clock_0/clk"
         ]
       },
       "processing_system7_0_FCLK_RESET0_N": {
@@ -2356,8 +2367,8 @@
           "comblock_0/axif_aresetn",
           "axi_smc/aresetn",
           "comblock_0/axil_aresetn",
-          "ccd_clock_0/rst_n",
-          "xadc_sampler_to_RAM_0/rst_n"
+          "xadc_sampler_to_RAM_0/rst_n",
+          "ccd_clock_0/rst_n"
         ]
       },
       "xadc_sampler_to_RAM_0_convst_o": {
